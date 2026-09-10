@@ -732,14 +732,18 @@ int rmnet_unassociate_network_device(struct net_device *dev)
 	}
 
 	config = (struct rmnet_phys_ep_conf_s *)
-		rcu_dereference(dev->rx_handler_data);
+		rcu_dereference_rtnl(dev->rx_handler_data);
 
 	if (!config)
 		return RMNET_CONFIG_UNKNOWN_ERROR;
 
-	kfree(config);
-
+	/* Detach the rx_handler before freeing its data, otherwise packets
+	 * in flight can still dereference rx_handler_data after the free.
+	 * netdev_rx_handler_unregister() synchronizes via synchronize_net().
+	 */
 	netdev_rx_handler_unregister(dev);
+
+	kfree(config);
 
 	/* Explicitly release the reference from the device */
 	dev_put(dev);
@@ -1179,6 +1183,7 @@ static void rmnet_force_unassociate_device(struct net_device *dev)
 {
 	int i, j;
 	struct net_device *vndev;
+	struct net_device *d;
 	struct rmnet_phys_ep_config *config;
 	struct rmnet_logical_ep_conf_s *cfg;
 	struct rmnet_free_vnd_work *vnd_work;
@@ -1233,6 +1238,28 @@ static void rmnet_force_unassociate_device(struct net_device *dev)
 		schedule_work(&vnd_work->work);
 	} else {
 		kfree(vnd_work);
+	}
+
+	/* Clear any logical endpoint on ANY device (not only VNDs) that
+	 * egresses into the device being unregistered. If such an endpoint
+	 * is left behind, the association dev_put() below can never run
+	 * (rmnet_unassociate_network_device() bails out with
+	 * RMNET_CONFIG_DEVICE_IN_USE) and the device leaks one reference,
+	 * wedging unregister_netdevice() forever with
+	 * "waiting for %s to become free. Usage count = 1".
+	 */
+	for_each_netdev(&init_net, d) {
+		if (d == dev)
+			continue;
+		for (i = RMNET_LOCAL_LOGICAL_ENDPOINT;
+		     i < RMNET_DATA_MAX_LOGICAL_EP; i++) {
+			cfg = _rmnet_get_logical_ep(d, i);
+			if (cfg && cfg->refcount && cfg->egress_dev == dev) {
+				LOGH("clearing dangling egress ep on %s -> %s",
+				     d->name, dev->name);
+				rmnet_unset_logical_endpoint_config(d, i);
+			}
+		}
 	}
 
 	config = _rmnet_get_phys_ep_config(dev);

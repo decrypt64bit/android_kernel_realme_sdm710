@@ -7940,12 +7940,12 @@ EXPORT_SYMBOL(netdev_refcnt_read);
  */
 static void netdev_wait_allrefs(struct net_device *dev)
 {
-	unsigned long rebroadcast_time, warning_time;
+	unsigned long rebroadcast_time, warning_time, start_time;
 	int refcnt;
 
 	linkwatch_forget_dev(dev);
 
-	rebroadcast_time = warning_time = jiffies;
+	rebroadcast_time = warning_time = start_time = jiffies;
 	refcnt = netdev_refcnt_read(dev);
 
 	while (refcnt != 0) {
@@ -7984,6 +7984,21 @@ static void netdev_wait_allrefs(struct net_device *dev)
 			pr_emerg("unregister_netdevice: waiting for %s to become free. Usage count = %d\n",
 				 dev->name, refcnt);
 			warning_time = jiffies;
+		}
+
+		/* A leaked reference would keep us here forever, wedging
+		 * rtnl users, hotplugging and any later unregistration
+		 * (observed as dead Wi-Fi / tethering / VPN after a tun or
+		 * wlan device goes away). All subscribers have been
+		 * rebroadcast the UNREGISTER event every second by now, so
+		 * after 20 seconds give up and let netdev_run_todo() force
+		 * the teardown instead of letting one stuck device take
+		 * the whole network stack down with it.
+		 */
+		if (time_after(jiffies, start_time + 20 * HZ)) {
+			pr_emerg("unregister_netdevice: %s still busy after 20s (refcnt=%d), forcing teardown\n",
+				 dev->name, refcnt);
+			return;
 		}
 	}
 }
@@ -8047,7 +8062,22 @@ void netdev_run_todo(void)
 		netdev_wait_allrefs(dev);
 
 		/* paranoia */
-		BUG_ON(netdev_refcnt_read(dev));
+		if (unlikely(netdev_refcnt_read(dev) != 0)) {
+			/* netdev_wait_allrefs() gave up: a leaked reference
+			 * that no notifier cleaned up. Waiting longer would
+			 * leave the device half-registered forever (and
+			 * rtnl_unlock() would spin through the todo list on
+			 * every unlock). Complete the teardown instead:
+			 * skip the refcount BUG_ONs that would panic the
+			 * kernel and release the device like a fully
+			 * unregistered one. The leaked reference is
+			 * abandoned on purpose; its owner can no longer be
+			 * trusted anyway.
+			 */
+			pr_emerg("unregister_netdevice: completing zombie '%s' after leaked reference\n",
+				 dev->name);
+			WARN_ON(1);
+		}
 		BUG_ON(!list_empty(&dev->ptype_all));
 		BUG_ON(!list_empty(&dev->ptype_specific));
 		WARN_ON(rcu_access_pointer(dev->ip_ptr));
