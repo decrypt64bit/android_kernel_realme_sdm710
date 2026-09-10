@@ -7991,12 +7991,15 @@ static void netdev_wait_allrefs(struct net_device *dev)
 		 * (observed as dead Wi-Fi / tethering / VPN after a tun or
 		 * wlan device goes away). All subscribers have been
 		 * rebroadcast the UNREGISTER event every second by now, so
-		 * after 20 seconds give up and let netdev_run_todo() force
+		 * after 6 seconds give up and let netdev_run_todo() force
 		 * the teardown instead of letting one stuck device take
-		 * the whole network stack down with it.
+		 * the whole network stack down with it. 6s keeps the
+		 * unplug/unregister hiccup short; on this device the
+		 * forced teardown has been proven safe (Wi-Fi, hotspot,
+		 * USB tethering all survive it and stay usable).
 		 */
-		if (time_after(jiffies, start_time + 20 * HZ)) {
-			pr_emerg("unregister_netdevice: %s still busy after 20s (refcnt=%d), forcing teardown\n",
+		if (time_after(jiffies, start_time + 6 * HZ)) {
+			pr_emerg("unregister_netdevice: %s still busy after 6s (refcnt=%d), forcing teardown\n",
 				 dev->name, refcnt);
 			return;
 		}
